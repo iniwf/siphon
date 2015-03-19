@@ -1,0 +1,11 @@
+ 
+ 			Filename ▼	Summary + Labels ▼	Uploaded ▼	ReleaseDate ▼	Size ▼	DownloadCount ▼	...
+  Download	pjmedia.zip	video capture and OpenGLES renderer implentation for iOS	Oct 2013	Oct 2013	25.5 KB	1696	 
+  Download	ios_dev.mm	video capture and renderer implentation for iOS	Mar 2013	Mar 2013	49.3 KB	1680	 
+  Download	build-libpj.sh	shell to generate universal iOS pjsip libraries	Jul 2011	Jul 2011	3.7 KB	3459	 
+  Download	patch-audioqueue-dev-20100312.txt	Patch audioqueue iphone audiodev and legacy audiodev for pjsip 1.4 and later	Mar 2010		32.0 KB	3091	 
+  Download	iphonesound-20091226.c	implementation of pjmedia for iPhone OS 2.x and later.	Dec 2009		24.4 KB	7744	 
+  Download	g729_va.c	Voiceage g729 codec: replace g729.c file in g729 patch to use VoiceAge implementation	Dec 2009		18.0 KB	3677	 
+  Download	patch-g729.txt	Patch g729 codec for pjsip 1.4 and later	Dec 2009		22.2 KB	3407	 
+  Download	patch-audio_dev.txt	Patch legacy audiodev for pjsip 1.4 and later	Nov 2009		1.3 KB	2604	 
+  Download	patch-mips_test.txt	Patch mips_test for pjsip	Nov 2009		5.8 KB	2037	 

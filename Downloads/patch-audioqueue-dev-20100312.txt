@@ -1,0 +1,1024 @@
+Index: pjmedia/build/os-auto.mak.in
+===================================================================
+--- pjmedia/build/os-auto.mak.in	(revision 3104)
++++ pjmedia/build/os-auto.mak.in	(working copy)
+@@ -10,6 +10,7 @@
+ #   - pa_old_darwinos:  PortAudio on MacOSX (old CoreAudio, for OSX 10.2)
+ #   - pa_win32:	    	PortAudio on Win32 (WMME)
+ #   - ds:	    	Win32 DirectSound (dsound.c)
++#   - iphone:       iPhone AudioQueue (iphonesound.c)
+ #   - null:	    	Null sound device (nullsound.c)
+ #   - external:		Link with no sounddev (app will provide)
+ AC_PJMEDIA_SND=@ac_pjmedia_snd@
+@@ -105,6 +119,24 @@
+ endif
+ 
+ #
++# iPod/iPhone
++#
++ifeq ($(AC_PJMEDIA_SND),iphone)
++# LEGACY
++#export PJMEDIA_OBJS += iphonesound.o
++#export CFLAGS += -DPJMEDIA_AUDIO_LEG_HAS_AUDIOQUEUE=1 \
++#    -DPJMEDIA_HAS_LEGACY_SOUND_API=0 \
++#    -DPJMEDIA_AUDIO_DEV_HAS_LEGACY_DEVICE=1
++
++# AUDIO DEV
++export PJMEDIA_AUDIODEV_OBJS += iphone_dev.o
++export CODEC_OBJS += passthrough.o
++export CFLAGS += -DPJMEDIA_AUDIO_DEV_HAS_AUDIOQUEUE=1
++
++export CFLAGS += -DPJMEDIA_AUDIO_DEV_HAS_PORTAUDIO=0 -DPJMEDIA_AUDIO_DEV_HAS_WMME=0
++endif
++
++#
+ # Null sound device
+ #
+ ifeq ($(AC_PJMEDIA_SND),null)
+Index: pjmedia/include/pjmedia-audiodev/config.h
+===================================================================
+--- pjmedia/include/pjmedia-audiodev/config.h	(revision 3104)
++++ pjmedia/include/pjmedia-audiodev/config.h	(working copy)
+@@ -135,6 +135,9 @@
+ #   define PJMEDIA_AUDIO_DEV_HAS_LEGACY_DEVICE	0
+ #endif
+ 
++#ifndef PJMEDIA_AUDIO_DEV_HAS_AUDIOQUEUE
++#   define PJMEDIA_AUDIO_DEV_HAS_AUDIOQUEUE  0
++#endif
+ 
+ /**
+  * @}
+Index: pjmedia/src/pjmedia-audiodev/legacy_dev.c
+===================================================================
+--- pjmedia/src/pjmedia-audiodev/legacy_dev.c	(revision 3104)
++++ pjmedia/src/pjmedia-audiodev/legacy_dev.c	(working copy)
+@@ -346,7 +346,8 @@
+ 	return status;
+     }
+ 
+-    *p_aud_strm = &strm->base;
++  *p_aud_strm = &strm->base;
++  (*p_aud_strm)->op = &stream_op;
+     return PJ_SUCCESS;
+ }
+ 
+Index: pjmedia/src/pjmedia-audiodev/iphone_dev.c
+===================================================================
+--- pjmedia/src/pjmedia-audiodev/iphone_dev.c	(revision 0)
++++ pjmedia/src/pjmedia-audiodev/iphone_dev.c	(revision 0)
+@@ -0,0 +1,909 @@
++/*
++ * Copyright (C) 2007-2010 Samuel Vinson <samuelv0304@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++#include <pjmedia-audiodev/audiodev_imp.h>
++#include <pjmedia/errno.h>
++#include <pj/assert.h>
++#include <pj/pool.h>
++#include <pj/log.h>
++#include <pj/os.h>
++
++#if PJMEDIA_AUDIO_DEV_HAS_AUDIOQUEUE
++
++#import <AudioToolbox/AudioToolbox.h>
++
++#define THIS_FILE     "iphone_dev.c"
++
++#if 0
++#   define TRACE_(x)    PJ_LOG(1,x)
++#else
++#   define TRACE_(x)
++#endif
++
++#define BITS_PER_SAMPLE     16
++#define AUDIO_BUFFERS 3
++
++typedef struct AQStruct
++{
++  AudioQueueRef queue;
++  AudioQueueBufferRef mBuffers[AUDIO_BUFFERS];
++  AudioStreamBasicDescription mDataFormat;
++  pj_timestamp timestamp;
++
++  pj_thread_desc thread_desc;
++  pj_thread_t   *thread;
++
++  void *buffer;
++  pj_uint32_t bufferOffset;
++} AQStruct;
++
++/* iPhone factory */
++struct iphone_aud_factory
++{
++    pjmedia_aud_dev_factory  base;
++    pj_pool_t     *pool;
++    pj_pool_factory   *pf;
++
++    pj_uint32_t             dev_count;
++    pjmedia_aud_dev_info   *dev_info;
++};
++
++/*
++ * Sound stream descriptor.
++ * This struct may be used for both unidirectional or bidirectional sound
++ * streams.
++ */
++struct iphone_aud_stream
++{
++  // Base
++  pjmedia_aud_stream   base;      /**< Base class.  */
++
++  // Pool
++  pj_pool_t   *pool;              /**< Memory pool.       */
++
++  // Common settings.
++  pjmedia_aud_param    param;     /**< Stream param.  */
++  pjmedia_aud_rec_cb   rec_cb;    /**< Record callback.   */
++  pjmedia_aud_play_cb  play_cb;   /**< Playback callback. */
++  void                *user_data; /**< Application data.  */
++
++  AQStruct *play_strm;            /**< Playback stream.       */
++  AQStruct *rec_strm;             /**< Capture stream.        */
++};
++
++/* Factory prototypes */
++static pj_status_t factory_init(pjmedia_aud_dev_factory *f);
++static pj_status_t factory_destroy(pjmedia_aud_dev_factory *f);
++static unsigned    factory_get_dev_count(pjmedia_aud_dev_factory *f);
++static pj_status_t factory_get_dev_info(pjmedia_aud_dev_factory *f,
++          unsigned index,
++          pjmedia_aud_dev_info *info);
++static pj_status_t factory_default_param(pjmedia_aud_dev_factory *f,
++           unsigned index,
++           pjmedia_aud_param *param);
++static pj_status_t factory_create_stream(pjmedia_aud_dev_factory *f,
++           const pjmedia_aud_param *param,
++           pjmedia_aud_rec_cb rec_cb,
++           pjmedia_aud_play_cb play_cb,
++           void *user_data,
++           pjmedia_aud_stream **p_aud_strm);
++
++/* Stream prototypes */
++static pj_status_t stream_get_param(pjmedia_aud_stream *strm,
++          pjmedia_aud_param *param);
++static pj_status_t stream_get_cap(pjmedia_aud_stream *strm,
++              pjmedia_aud_dev_cap cap,
++              void *value);
++static pj_status_t stream_set_cap(pjmedia_aud_stream *strm,
++              pjmedia_aud_dev_cap cap,
++              const void *value);
++static pj_status_t stream_start(pjmedia_aud_stream *strm);
++static pj_status_t stream_stop(pjmedia_aud_stream *strm);
++static pj_status_t stream_destroy(pjmedia_aud_stream *strm);
++
++static pjmedia_aud_dev_factory_op iphone_fact_op =
++  {
++      &factory_init,
++      &factory_destroy,
++      &factory_get_dev_count,
++      &factory_get_dev_info,
++      &factory_default_param,
++      &factory_create_stream
++  };
++
++static pjmedia_aud_stream_op iphone_strm_op =
++{
++    &stream_get_param,
++    &stream_get_cap,
++    &stream_set_cap,
++    &stream_start,
++    &stream_stop,
++    &stream_destroy
++};
++
++/****************************************************************************
++ * Callback operations
++ */
++
++/*
++ * Technical Q&A QA1558
++ * Audio Queue – Handling Playback Interruptions
++ * Q: Do I need to recreate my Audio Queue after receiving an interruption if I
++ * want to continue playback after the interruption?
++ *
++ * A: Yes. Currently to support Audio Queue playback though an interruption
++ * event, applications need to dispose of the currently playing Audio Queue
++ * object (by calling AudioQueueDispose) when the
++ * AudioSessionInterruptionListener receives a kAudioSessionStartInterruption
++ * notification.
++ *
++ * Once the interruption is over and the AudioSessionInterruptionListener
++ * receives the kAudioSessionEndInterruption notification, a new Audio Queue
++ * object will need to be created and started.
++ *
++ * Applications should save and restore any necessary state (eg. audio frame
++ * number) required to pick up playback from the point of interruption.
++ */
++static
++void interruptionListenerCallback(void *userData, UInt32 interruptionState)
++{
++  TRACE_((THIS_FILE, "interruptionListenerCallback %d.", interruptionState));
++  if (interruptionState == kAudioSessionBeginInterruption)
++  {
++    TRACE_((THIS_FILE, "Interrupted. Stopping playback and/or recording ?"));
++    //pjmedia_snd_stream_pause(stream); // When QA1558 will be fixed
++    // FIXME pjsua_call_set_hold
++    //pjsua_set_null_snd_dev(); //  FIXME:
++  }
++  else if (interruptionState == kAudioSessionEndInterruption)
++  {
++    TRACE_((THIS_FILE,
++               "Interruption was removed. Resume playback and/or recording ?"));
++    //pjmedia_snd_stream_resume(stream); // When QA1558 will be fixed
++    // FIXME pjsua_call_reinvite
++    //pjsua_set_snd_dev(PJMEDIA_AUD_DEFAULT_CAPTURE_DEV,
++    //                  PJMEDIA_AUD_DEFAULT_PLAYBACK_DEV); // FIXME:
++  }
++}
++
++static void playAQBufferCallbackPCM(void *userData, AudioQueueRef outQ,
++                                 AudioQueueBufferRef outQB)
++{
++  //pjmedia_snd_stream *play_strm = userData;
++  struct iphone_aud_stream *strm = userData;
++  pjmedia_frame frame;
++
++  pj_status_t status = PJ_SUCCESS;
++
++  //TRACE_((THIS_FILE, "playAQBufferCallback"));
++  //    inData = (AQPlayerStruct *)in;
++  //    if (inData->frameCount > 0)
++  {
++    if (!pj_thread_is_registered())
++    {
++      pj_bzero(strm->play_strm->thread_desc, sizeof(pj_thread_desc));
++      pj_thread_register("iphone_playcb", strm->play_strm->thread_desc,
++          &strm->play_strm->thread);
++    }
++
++    /* Calculate bytes per frame */
++    outQB->mAudioDataByteSize = strm->param.samples_per_frame * //BYTES_PER_SAMPLE;
++    strm->param.bits_per_sample / 8;
++
++    frame.type = PJMEDIA_FRAME_TYPE_AUDIO;
++    frame.buf = outQB->mAudioData;
++    frame.size = outQB->mAudioDataByteSize; //
++    frame.timestamp.u64 = strm->play_strm->timestamp.u64;
++
++    /* Get frame from application. */
++    status = (*strm->play_cb)(strm->user_data, &frame);
++    if (status != PJ_SUCCESS)
++    {
++      PJ_LOG(1, (THIS_FILE, "playAQBufferCallback err %d\n", status));
++    }
++
++    strm->play_strm->timestamp.u64 += strm->param.samples_per_frame;
++    AudioQueueEnqueueBuffer(outQ, outQB, 0, NULL);
++  }
++}
++
++static void recAQBufferCallbackPCM(
++                                void *userData,
++                                AudioQueueRef inQ,
++                                AudioQueueBufferRef inQB,
++                                const AudioTimeStamp *inStartTime,
++                                UInt32 inNumPackets,
++                                const AudioStreamPacketDescription *inPacketDesc)
++{
++  pj_status_t status = PJ_SUCCESS;
++  struct iphone_aud_stream *stream = userData;
++  pj_uint8_t *buf;
++  pj_uint32_t remaining, len;
++  pj_uint32_t bytes_per_frame;
++
++  //TRACE_((THIS_FILE, "recAQBufferCallback"));
++  if (!pj_thread_is_registered())
++  {
++    pj_bzero(stream->rec_strm->thread_desc, sizeof(pj_thread_desc));
++    pj_thread_register("iphone_reccb", stream->rec_strm->thread_desc,
++              &stream->rec_strm->thread);
++  }
++
++  bytes_per_frame = stream->param.samples_per_frame *
++      stream->param.bits_per_sample / 8;
++  buf = inQB->mAudioData;
++  remaining = inQB->mAudioDataByteSize;
++  while (remaining > 0)
++  {
++    if (stream->rec_strm->bufferOffset >= bytes_per_frame)
++    {
++      pjmedia_frame frame; // FIXME QUICKLY !!!!!!
++      frame.type = PJMEDIA_FRAME_TYPE_AUDIO;
++      frame.buf = stream->rec_strm->buffer;
++      frame.size = bytes_per_frame;
++      frame.timestamp.u64 = stream->rec_strm->timestamp.u64;
++      status = stream->rec_cb(stream->user_data, &frame);
++      if (status != PJ_SUCCESS)
++      {
++        PJ_LOG(1, (THIS_FILE, "recAQBufferCallback err %d\n", status));
++        //return;
++      }
++      stream->rec_strm->timestamp.u64 += stream->param.samples_per_frame;
++      stream->rec_strm->bufferOffset = 0;
++    }
++
++    len = /*stream->rec_strm->bufferSize*/bytes_per_frame - stream->rec_strm->bufferOffset;
++    if (len > remaining)
++      len = remaining;
++    pj_memcpy((char *)stream->rec_strm->buffer + stream->rec_strm->bufferOffset,
++              buf, len);
++    buf += len;
++    remaining -= len;
++    stream->rec_strm->bufferOffset += len;
++  }
++
++  AudioQueueEnqueueBuffer(inQ, inQB, 0, NULL);
++}
++
++/**
++ *
++ */
++static void audioSessionCategory(pjmedia_dir dir)
++{
++  UInt32 sessionCategory;
++  OSStatus status;
++
++  switch (dir)
++  {
++    case PJMEDIA_DIR_CAPTURE:
++      TRACE_((THIS_FILE, "audioSessionCategory RecordAudio %d\n", dir));
++      sessionCategory = kAudioSessionCategory_RecordAudio;
++      break;
++    case PJMEDIA_DIR_PLAYBACK:
++      TRACE_((THIS_FILE, "audioSessionCategory MediaPlayback %d\n", dir));
++      sessionCategory = kAudioSessionCategory_MediaPlayback;
++      break;
++    case PJMEDIA_DIR_CAPTURE_PLAYBACK:
++      TRACE_((THIS_FILE, "audioSessionCategory PlayAndRecord %d\n", dir));
++      sessionCategory = kAudioSessionCategory_PlayAndRecord;
++      break;
++    default:
++      return;
++  }
++
++  // before instantiating the playback/recording audio queue object,
++  // set the audio session category
++  status = AudioSessionSetProperty(kAudioSessionProperty_AudioCategory,
++                                   sizeof(sessionCategory), &sessionCategory);
++  if (status)
++    PJ_LOG(1, (THIS_FILE,
++         "AudioSessionSetProperty Audio Category err %d\n", status));
++}
++
++
++/**
++ * an audio queue object doesn't provide audio level information unless you
++ * enable it to do so
++ */
++static void enableLevelMetering(AudioQueueRef queue)
++{
++  OSStatus status;
++  UInt32 level = true;
++
++  status = AudioQueueSetProperty(queue,
++                                 kAudioQueueProperty_EnableLevelMetering,
++                                 &level, sizeof(UInt32));
++  if (status)
++  {
++    PJ_LOG(1, (THIS_FILE, "AudioQueueSetProperty err %d", status));
++  }
++}
++
++/****************************************************************************
++ * Factory operations
++ */
++
++/*
++ * Init legacy audio driver.
++ */
++pjmedia_aud_dev_factory* pjmedia_iphone_factory(pj_pool_factory *pf)
++{
++    struct iphone_aud_factory *f;
++    pj_pool_t *pool;
++
++    TRACE_((THIS_FILE, "pjmedia_iphone_factory."));
++
++    pool = pj_pool_create(pf, "iphone", 512, 512, NULL);
++    f = PJ_POOL_ZALLOC_T(pool, struct iphone_aud_factory);
++    f->pf = pf;
++    f->pool = pool;
++    f->base.op = &iphone_fact_op;
++
++    return &f->base;
++}
++
++/* API: init factory */
++static pj_status_t factory_init(pjmedia_aud_dev_factory *f)
++{
++  struct iphone_aud_factory *af = (struct iphone_aud_factory*)f;
++  OSStatus status;
++
++  TRACE_((THIS_FILE, "factory_init."));
++  status = AudioSessionInitialize (NULL, kCFRunLoopDefaultMode,
++                                   interruptionListenerCallback, NULL);
++  // kAudioSessionNoError, PJ_SUCCESS
++  // kAudioSessionNotInitialized, PJMEDIA_EAUD_INIT
++  // kAudioSessionAlreadyInitialized,
++  // kAudioSessionInitializationError
++  if (status != kAudioSessionNoError)
++    return PJMEDIA_EAUD_SYSERR;
++
++  /* Enumerate sound devices */
++  af->dev_count = 1;
++  af->dev_info = (pjmedia_aud_dev_info*)
++         pj_pool_calloc(af->pool, af->dev_count, sizeof(pjmedia_aud_dev_info));
++
++  pj_ansi_strcpy(af->dev_info[0].name, "IPHONE");
++  af->dev_info[0].input_count = 1;
++  af->dev_info[0].output_count = 1;
++  af->dev_info[0].default_samples_per_sec = 8000;
++  pj_ansi_strcpy(af->dev_info[0].driver, "AudioQueue");
++
++  af->dev_info[0].caps = PJMEDIA_AUD_DEV_CAP_OUTPUT_ROUTE |
++      PJMEDIA_AUD_DEV_CAP_OUTPUT_VOLUME_SETTING |
++      PJMEDIA_AUD_DEV_CAP_OUTPUT_LATENCY |
++      PJMEDIA_AUD_DEV_CAP_INPUT_LATENCY;
++  af->dev_info[0].routes = PJMEDIA_AUD_DEV_ROUTE_EARPIECE |
++      PJMEDIA_AUD_DEV_ROUTE_LOUDSPEAKER;
++
++  return PJ_SUCCESS;
++}
++
++/* API: destroy factory */
++static pj_status_t factory_destroy(pjmedia_aud_dev_factory *f)
++{
++  struct iphone_aud_factory *af = (struct iphone_aud_factory*)f;
++  pj_pool_t *pool;
++
++  TRACE_((THIS_FILE, "factory_destroy."));
++
++  pool = af->pool;
++  af->pool = NULL;
++  pj_pool_release(pool);
++
++  return PJ_SUCCESS;
++}
++
++/* API: get number of devices */
++static unsigned factory_get_dev_count(pjmedia_aud_dev_factory *f)
++{
++  struct iphone_aud_factory *af = (struct iphone_aud_factory*)f;
++  TRACE_((THIS_FILE, "factory_get_dev_count."));
++
++  return af->dev_count;
++}
++
++/* API: get device info */
++static pj_status_t factory_get_dev_info(pjmedia_aud_dev_factory *f,
++          unsigned index,
++          pjmedia_aud_dev_info *info)
++{
++  struct iphone_aud_factory *af = (struct iphone_aud_factory*)f;
++
++  TRACE_((THIS_FILE, "factory_get_dev_info."));
++  PJ_ASSERT_RETURN(index < af->dev_count, PJMEDIA_EAUD_INVDEV);
++
++  pj_memcpy(info, &af->dev_info[index], sizeof(*info));
++
++  return PJ_SUCCESS;
++}
++
++/* API: create default device parameter */
++static pj_status_t factory_default_param(pjmedia_aud_dev_factory *f,
++           unsigned index,
++           pjmedia_aud_param *param)
++{
++  struct iphone_aud_factory *af = (struct iphone_aud_factory*)f;
++  struct pjmedia_aud_dev_info *di = &af->dev_info[index];
++
++  TRACE_((THIS_FILE, "factory_default_param."));
++  PJ_ASSERT_RETURN(index < af->dev_count, PJMEDIA_EAUD_INVDEV);
++
++  pj_bzero(param, sizeof(*param));
++  if (di->input_count && di->output_count) {
++    param->dir = PJMEDIA_DIR_CAPTURE_PLAYBACK;
++    param->rec_id = index;
++    param->play_id = index;
++  } else if (di->input_count) {
++    param->dir = PJMEDIA_DIR_CAPTURE;
++    param->rec_id = index;
++    param->play_id = PJMEDIA_AUD_INVALID_DEV;
++  } else if (di->output_count) {
++    param->dir = PJMEDIA_DIR_PLAYBACK;
++    param->play_id = index;
++    param->rec_id = PJMEDIA_AUD_INVALID_DEV;
++  } else {
++    return PJMEDIA_EAUD_INVDEV;
++  }
++
++  param->clock_rate = di->default_samples_per_sec;
++  param->channel_count = 1;
++  param->samples_per_frame = di->default_samples_per_sec * 20 / 1000;
++  param->bits_per_sample = BITS_PER_SAMPLE;
++  param->flags = PJMEDIA_AUD_DEV_CAP_OUTPUT_ROUTE | di->caps;
++  param->output_route = PJMEDIA_AUD_DEV_ROUTE_DEFAULT;
++
++  return PJ_SUCCESS;
++}
++
++/* API: create stream */
++static pj_status_t factory_create_stream(pjmedia_aud_dev_factory *f,
++           const pjmedia_aud_param *param,
++           pjmedia_aud_rec_cb rec_cb,
++           pjmedia_aud_play_cb play_cb,
++           void *user_data,
++           pjmedia_aud_stream **p_aud_strm)
++{
++  struct iphone_aud_factory *af = (struct iphone_aud_factory*)f;
++  pj_pool_t *pool;
++  struct iphone_aud_stream *strm;
++  pj_status_t status;
++
++  AQStruct *aq;
++
++  TRACE_((THIS_FILE, "factory_create_stream."));
++
++  /* Can only support 16bits per sample */
++  PJ_ASSERT_RETURN(param->bits_per_sample == BITS_PER_SAMPLE, PJ_EINVAL);
++
++  /* Initialize our stream data */
++  pool = pj_pool_create(af->pf, "iphone-dev", 512, 512, NULL);
++  PJ_ASSERT_RETURN(pool != NULL, PJ_ENOMEM);
++
++  // before instantiating the playback/recording audio queue object,
++  // set the audio session category
++  audioSessionCategory(param->dir);
++
++  strm = PJ_POOL_ZALLOC_T(pool, struct iphone_aud_stream);
++  strm->pool = pool;
++  strm->rec_cb = rec_cb;
++  strm->play_cb = play_cb;
++  strm->user_data = user_data;
++  pj_memcpy(&strm->param, param, sizeof(*param));
++
++  if ((strm->param.flags & PJMEDIA_AUD_DEV_CAP_EXT_FORMAT) == 0)
++    strm->param.ext_fmt.id = PJMEDIA_FORMAT_L16;
++
++  AudioStreamBasicDescription dataFormat;
++  pj_memset(&dataFormat, 0, sizeof(AudioStreamBasicDescription));
++  dataFormat.mSampleRate = (Float64)param->clock_rate;
++  dataFormat.mFormatID = kAudioFormatLinearPCM;
++  dataFormat.mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked;
++  dataFormat.mFramesPerPacket = 1;
++  dataFormat.mBytesPerPacket = param->channel_count * param->bits_per_sample / 8;
++  dataFormat.mBytesPerFrame = param->channel_count * param->bits_per_sample / 8; // FIXME 0
++  dataFormat.mChannelsPerFrame = param->channel_count;
++  dataFormat.mBitsPerChannel = 16; // FIXME 0
++  
++  
++  /* Open the stream */
++  if (param->dir & PJMEDIA_DIR_ENCODING) {
++    aq = strm->rec_strm = PJ_POOL_ZALLOC_T(pool, AQStruct);
++    aq->mDataFormat = dataFormat;
++
++    aq->bufferOffset = 0;
++    aq->buffer = pj_pool_zalloc(pool, param->samples_per_frame *
++                                param->bits_per_sample / 8);
++
++    TRACE_((THIS_FILE, "pjmedia_snd_open AudioQueueNewInput."));
++    status = AudioQueueNewInput (&(aq->mDataFormat),
++                                 recAQBufferCallbackPCM,
++                                 strm, // FIXME : aq ?
++                                 NULL,
++                                 kCFRunLoopCommonModes,
++                                 0,
++                                 &(aq->queue));
++    if (status)
++    {
++      PJ_LOG(1, (THIS_FILE, "AudioQueueNewInput err %d", status));
++      return PJMEDIA_ERROR; // FIXME
++    }
++    
++    // FIXME: enableLevelMetering ??
++    enableLevelMetering(aq->queue);
++  }
++
++  if (param->dir & PJMEDIA_DIR_DECODING) {
++    aq = strm->play_strm = PJ_POOL_ZALLOC_T(pool, AQStruct);
++    aq->mDataFormat = dataFormat;
++
++    TRACE_((THIS_FILE, "pjmedia_snd_open AudioQueueNewOutput."));
++    status = AudioQueueNewOutput(&(aq->mDataFormat),
++                                 playAQBufferCallbackPCM,
++                                 strm, // FIXME : aq ?
++                                 //CFRunLoopGetCurrent(),
++                                 NULL,
++                                 kCFRunLoopCommonModes,
++                                 0,
++                                 &(aq->queue));
++    if (status)
++    {
++      PJ_LOG(1, (THIS_FILE, "AudioQueueNewOutput err %d", status));
++      return PJMEDIA_ERROR; // FIXME
++    }
++    
++    // FIXME: Capacity ?
++    TRACE_((THIS_FILE, "factory_create_stream AudioQueueSetParameter."));
++
++    AudioQueueSetParameter(aq->queue, kAudioQueueParam_Volume, 1.0);
++
++    //FIXME: enable LevelMetering ??
++    enableLevelMetering(aq->queue);
++  }
++
++
++  /* Done */
++  strm->base.op = &iphone_strm_op;
++  *p_aud_strm = &strm->base;
++
++  return PJ_SUCCESS;
++}
++
++/****************************************************************************
++ * Stream operations
++ */
++/* API: Get stream info. */
++static pj_status_t stream_get_param(pjmedia_aud_stream *s,
++                                    pjmedia_aud_param *pi)
++{
++  struct iphone_aud_stream *strm = (struct iphone_aud_stream*)s;
++
++  PJ_ASSERT_RETURN(strm && pi, PJ_EINVAL);
++  //PJ_ASSERT_RETURN(strm->play_strm || strm->rec_strm, PJ_EINVALIDOP);
++  pj_memcpy(pi, &strm->param, sizeof(*pi));
++  /* Update the volume setting */
++  if (stream_get_cap(s, PJMEDIA_AUD_DEV_CAP_OUTPUT_VOLUME_SETTING,
++        &pi->output_vol) == PJ_SUCCESS)
++  {
++    pi->flags |= PJMEDIA_AUD_DEV_CAP_OUTPUT_VOLUME_SETTING;
++  }
++
++  if (stream_get_cap(s, PJMEDIA_AUD_DEV_CAP_OUTPUT_LATENCY,
++        &pi->output_latency_ms) == PJ_SUCCESS)
++  {
++    pi->flags |= PJMEDIA_AUD_DEV_CAP_OUTPUT_LATENCY;
++  }
++
++  if (stream_get_cap(s, PJMEDIA_AUD_DEV_CAP_INPUT_LATENCY,
++        &pi->input_latency_ms) == PJ_SUCCESS)
++  {
++    pi->flags |= PJMEDIA_AUD_DEV_CAP_INPUT_LATENCY;
++  }
++
++  return PJ_SUCCESS;
++}
++
++/* API: get capability */
++static pj_status_t stream_get_cap(pjmedia_aud_stream *s,
++          pjmedia_aud_dev_cap cap,
++          void *pval)
++{
++  struct iphone_aud_stream *strm = (struct iphone_aud_stream*)s;
++  OSStatus status = 0;
++  PJ_ASSERT_RETURN(strm && pval, PJ_EINVAL);
++
++  if (cap==PJMEDIA_AUD_DEV_CAP_OUTPUT_VOLUME_SETTING && strm->play_strm->queue)
++  {
++    Float32 vol;
++    status = AudioQueueGetParameter(strm->play_strm->queue,
++                                    kAudioQueueParam_Volume, &vol);
++    if (!status)
++    {
++      *(unsigned*)pval = (vol * 100);
++      return PJ_SUCCESS;
++    }
++  }
++  else if (cap==PJMEDIA_AUD_DEV_CAP_OUTPUT_LATENCY && strm->play_strm->queue)
++  {
++    Float32 lat;
++    UInt32 size = sizeof(lat);
++    status = AudioSessionGetProperty(kAudioSessionProperty_CurrentHardwareOutputLatency,
++                                     &size, &lat);
++    if (!status)
++    { //*(unsigned*)pval = strm->param.input_latency_ms;
++      *(unsigned*)pval = lat * 1000;
++      return PJ_SUCCESS;
++    }
++  }
++  else if (cap==PJMEDIA_AUD_DEV_CAP_OUTPUT_ROUTE && strm->play_strm->queue)
++  {
++    *(pjmedia_aud_dev_route*)pval = strm->param.output_route;
++    return PJ_SUCCESS;
++  }
++  else if (cap==PJMEDIA_AUD_DEV_CAP_INPUT_LATENCY && strm->rec_strm->queue)
++  {
++    Float32 lat;
++    UInt32 size = sizeof(lat);
++    status = AudioSessionGetProperty(kAudioSessionProperty_CurrentHardwareInputLatency,
++                                     &size, &lat);
++    if (!status)
++    { //*(unsigned*)pval = strm->param.input_latency_ms;
++      *(unsigned*)pval = lat * 1000;
++      return PJ_SUCCESS;
++    }
++  }
++
++  if (status)
++    PJ_LOG(1, (THIS_FILE, "AudioQueueGetParameter/AudioSessionGetProperty err %d", status));
++  return PJMEDIA_EAUD_INVCAP;
++}
++
++/* API: set capability */
++static pj_status_t stream_set_cap(pjmedia_aud_stream *s,
++          pjmedia_aud_dev_cap cap,
++          const void *pval)
++{
++  struct iphone_aud_stream *strm = (struct iphone_aud_stream*)s;
++  OSStatus status = 0;
++  PJ_ASSERT_RETURN(strm && pval, PJ_EINVAL);
++
++  if (strm->play_strm->queue)
++    switch (cap)
++    {
++      case PJMEDIA_AUD_DEV_CAP_OUTPUT_VOLUME_SETTING:
++      {
++  //if (cap==PJMEDIA_AUD_DEV_CAP_OUTPUT_VOLUME_SETTING &&
++  //         strm->play_strm->queue)
++  //{
++        /* Output volume setting */
++        unsigned vol = *(unsigned*)pval;
++        Float32 volume;
++
++        if (vol > 100)
++          vol = 100;
++        volume = vol / 100.;
++        status = AudioQueueSetParameter(strm->play_strm->queue, kAudioQueueParam_Volume,
++                                        volume);
++        if (!status)
++        {
++          PJ_LOG(1, (THIS_FILE, "AudioQueueSetParameter err %d", status));
++          return PJMEDIA_EAUD_SYSERR;
++        }
++        strm->param.output_vol = *(unsigned*)pval;
++        return PJ_SUCCESS;
++      }
++      case PJMEDIA_AUD_DEV_CAP_OUTPUT_ROUTE:
++      {
++        pjmedia_aud_dev_route r = *(const pjmedia_aud_dev_route*)pval;
++        UInt32 route = (r == PJMEDIA_AUD_DEV_ROUTE_LOUDSPEAKER ?
++            kAudioSessionOverrideAudioRoute_Speaker :
++            kAudioSessionOverrideAudioRoute_None);
++
++        status = AudioSessionSetProperty (kAudioSessionProperty_OverrideAudioRoute,
++                                          sizeof(route), &route);
++        if (status)
++        {
++          PJ_LOG(1, (THIS_FILE, "AudioSessionSetProperty err %d", status));
++          return PJMEDIA_EAUD_SYSERR;
++        }
++        strm->param.output_route = r;
++        return PJ_SUCCESS;
++      }
++      default:
++        return PJMEDIA_EAUD_INVCAP;
++    }
++
++
++  return PJMEDIA_EAUD_INVCAP;
++}
++
++/* API: Start stream. */
++static pj_status_t stream_start(pjmedia_aud_stream *s)
++{
++  struct iphone_aud_stream *strm = (struct iphone_aud_stream*)s;
++  OSStatus status;
++  pj_int32_t i;
++  AQStruct *aq;
++
++  TRACE_((THIS_FILE, "stream_start."));
++  status = AudioSessionSetActive(true);
++  if (status != kAudioSessionNoError)
++  {
++    PJ_LOG(1, (THIS_FILE,
++               "AudioSessionSetActive err %d\n", status));
++    return PJMEDIA_EAUD_NOTREADY;
++  }
++
++  if (strm->play_strm)
++   {
++     TRACE_((THIS_FILE, "stream_start : play back starting..."));
++     aq = strm->play_strm;
++     UInt32 bufferBytes = strm->param.samples_per_frame *
++           strm->param.bits_per_sample / 8 * aq->mDataFormat.mBytesPerFrame;
++     for (i=0; i<AUDIO_BUFFERS; i++)
++     {
++       status = AudioQueueAllocateBuffer(aq->queue, bufferBytes,
++                                         &(aq->mBuffers[i]));
++       if (status)
++       {
++         PJ_LOG(1, (THIS_FILE,
++             "AudioQueueAllocateBuffer[%d] err %d\n",i, status));
++         return PJMEDIA_EAUD_INIT;
++       }
++       /* "Prime" by calling the callback once per buffer */
++       playAQBufferCallbackPCM (strm, aq->queue, aq->mBuffers[i]);
++     }
++     status = AudioQueueStart(aq->queue, NULL);
++     if (status)
++     {
++       PJ_LOG(1, (THIS_FILE, "AudioQueueStart err %d\n", status));
++       return PJMEDIA_EAUD_INIT;
++     }
++     TRACE_((THIS_FILE, "stream_start : play back started"));
++   }
++
++  if (strm->rec_strm)
++   {
++     TRACE_((THIS_FILE, "stream_start : capture starting..."));
++     aq = strm->rec_strm;
++     UInt32 bufferBytes;
++     bufferBytes = strm->param.samples_per_frame * strm->param.bits_per_sample / 8;
++     for (i = 0; i < AUDIO_BUFFERS; ++i)
++     {
++       status = AudioQueueAllocateBuffer (aq->queue, bufferBytes,
++                                          &(aq->mBuffers[i]));
++
++       if (status)
++       {
++         PJ_LOG(1, (THIS_FILE,
++             "AudioQueueAllocateBuffer[%d] err %d\n",i, status));
++         return PJMEDIA_EAUD_INIT;
++       }
++       AudioQueueEnqueueBuffer (aq->queue, aq->mBuffers[i]/*/&buffer*/, 0, NULL);
++     }
++     status = AudioQueueStart (aq->queue, NULL);
++     if (status)
++     {
++       PJ_LOG(1, (THIS_FILE, "Starting capture stream error %d", status));
++       return PJMEDIA_EAUD_INIT;
++     }
++
++     TRACE_((THIS_FILE, "stream_start : capture started..."));
++   }
++
++   return PJ_SUCCESS;
++}
++
++/* API: Stop stream. */
++static pj_status_t stream_stop(pjmedia_aud_stream *s)
++{
++  struct iphone_aud_stream *strm = (struct iphone_aud_stream*)s;
++  OSStatus status;
++  AQStruct *aq;
++  pj_status_t state = PJ_SUCCESS;
++
++  TRACE_((THIS_FILE, "stream_stop."));
++
++  if (strm->rec_strm)
++  {
++    TRACE_((THIS_FILE, "Stopping capture stream"));
++    aq = strm->rec_strm;
++    status = AudioQueueStop (aq->queue, true);
++    if (status)
++    {
++      PJ_LOG(1, (THIS_FILE, "Stopping capture stream error %d", status));
++      state = PJMEDIA_EAUD_ERR;
++    }
++  }
++
++  if (strm->play_strm)
++  {
++    TRACE_((THIS_FILE, "Stopping playback stream"));
++    aq = strm->play_strm;
++    status = AudioQueueStop (aq->queue, true);
++    if (status)
++    {
++      PJ_LOG(1, (THIS_FILE, "Stopping playback stream error %d", status));
++      state = PJMEDIA_EAUD_ERR;
++    }
++  }
++  // Now that recording has stopped, deactivate the audio session
++  status = AudioSessionSetActive(false);
++  if (status)
++  {
++    PJ_LOG(1, (THIS_FILE, "AudioSessionSetActive err %d\n", status));
++    state = PJMEDIA_EAUD_ERR;
++  }
++
++  return state;
++}
++
++/* API: Destroy stream. */
++static pj_status_t stream_destroy(pjmedia_aud_stream *s)
++{
++  struct iphone_aud_stream *strm = (struct iphone_aud_stream*)s;
++  OSStatus status;
++  AQStruct *aq;
++  pj_pool_t *pool;
++  pj_status_t state = PJ_SUCCESS;
++
++  TRACE_((THIS_FILE, "stream_destroy."));
++  PJ_ASSERT_RETURN(s != NULL, PJ_EINVAL);
++
++  stream_stop(s);
++
++  if (strm->play_strm)
++  {
++    TRACE_((THIS_FILE, "Disposing playback stream"));
++    aq = strm->play_strm;
++
++    status = AudioQueueDispose (aq->queue, true);
++    if (status)
++    {
++      PJ_LOG(1, (THIS_FILE, "Disposing playback stream error %d", status));
++      state = PJMEDIA_EAUD_SYSERR;
++    }
++    pj_bzero(aq, sizeof(strm->play_strm));
++    strm->play_strm = NULL;
++  }
++
++  if (strm->rec_strm)
++  {
++    TRACE_((THIS_FILE, "Disposing capture stream"));
++    aq = strm->rec_strm;
++
++    status = AudioQueueDispose (aq->queue, true);
++    if (status)
++    {
++      PJ_LOG(1, (THIS_FILE, "Disposing capture stream error %d", status));
++      state = PJMEDIA_EAUD_SYSERR;
++    }
++    pj_bzero(aq->buffer, strm->param.samples_per_frame *
++             strm->param.bits_per_sample / 8);
++    pj_bzero(aq, sizeof(strm->rec_strm));
++    strm->rec_strm = NULL;
++  }
++
++  pool = strm->pool;
++  pj_bzero(strm, sizeof(strm));
++  pj_pool_release(pool);
++
++  return state;
++}
++
++#endif /* PJMEDIA_AUDIO_DEV_HAS_AUDIOQUEUE */
++
+Index: pjmedia/src/pjmedia-audiodev/audiodev.c
+===================================================================
+--- pjmedia/src/pjmedia-audiodev/audiodev.c	(revision 3104)
++++ pjmedia/src/pjmedia-audiodev/audiodev.c	(working copy)
+@@ -94,6 +94,14 @@
+ pjmedia_aud_dev_factory* pjmedia_null_audio_factory(pj_pool_factory *pf);
+ #endif
+ 
++#if PJMEDIA_AUDIO_DEV_HAS_LEGACY_DEVICE
++pjmedia_aud_dev_factory* pjmedia_legacy_factory(pj_pool_factory *pf);
++#endif
++
++#if PJMEDIA_AUDIO_DEV_HAS_AUDIOQUEUE
++pjmedia_aud_dev_factory* pjmedia_iphone_factory(pj_pool_factory *pf);
++#endif
++
+ #define MAX_DRIVERS	16
+ #define MAX_DEVS	64
+ 
+@@ -366,8 +374,8 @@
+     }
+ 
+     /* Register error subsystem */
+-    pj_register_strerror(PJMEDIA_AUDIODEV_ERRNO_START, 
+-			 PJ_ERRNO_SPACE_SIZE, 
++    pj_register_strerror(PJMEDIA_AUDIODEV_ERRNO_START,
++			 PJ_ERRNO_SPACE_SIZE,
+ 			 &pjmedia_audiodev_strerror);
+ 
+     /* Init */
+@@ -397,6 +405,12 @@
+ #if PJMEDIA_AUDIO_DEV_HAS_NULL_AUDIO
+     aud_subsys.drv[aud_subsys.drv_cnt++].create = &pjmedia_null_audio_factory;
+ #endif
++#if PJMEDIA_AUDIO_DEV_HAS_LEGACY_DEVICE
++    aud_subsys.drv[aud_subsys.drv_cnt++].create = &pjmedia_legacy_factory;
++#endif
++#if PJMEDIA_AUDIO_DEV_HAS_AUDIOQUEUE
++    aud_subsys.drv[aud_subsys.drv_cnt++].create = &pjmedia_iphone_factory;
++#endif
+ 
+     /* Initialize each factory and build the device ID list */
+     for (i=0; i<aud_subsys.drv_cnt; ++i) {
+
+ 
